@@ -5,83 +5,25 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
-        var config = new ConfigurationBuilder()
-            .AddJsonFile("appsettings.json", optional: true)
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var token = config["GitHub:Token"];
-        var org = config["GitHub:Org"];
-
-        if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(org))
-        {
-            Console.Error.WriteLine("Error: GitHub:Token or GitHub:Org missing. Set with `dotnet user-secrets set`.");
-            return 1;
-        }
-
-        var productHeader = new ProductHeaderValue("GitMon");
-        var client = new GitHubClient(productHeader)
-        {
-            Credentials = new Credentials(token)
-        };
-
-        var testRepo = "RootApp.Shared"; // e.g., "RootApp.Shared"
-        var start = DateTimeOffset.UtcNow.AddDays(-30);
-        var prs = await FetchMergedPrsAsync(client, org, testRepo, start);
-
-        Console.WriteLine($"{testRepo} — merged PRs in last 30d: {prs.Count}");
-        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(10))
-        {
-            Console.WriteLine($"#{pr.Number} by {pr.User.Login} — merged {pr.MergedAt:O} — {pr.Title}");
-        }
-
-        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(5))
-        {
-            var reviews = await FetchReviewsAsync(client, org, testRepo, pr.Number, pr.MergedAt.Value);
-
-            Console.WriteLine($"PR #{pr.Number} — {reviews.Count} review(s):");
-            foreach (var r in reviews)
-            {
-                Console.WriteLine($"  {r.User.Login}: {r.State} at {r.SubmittedAt:O}");
-            }
-        }
-
-        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(5))
-        {
-            var reviews = await FetchReviewsAsync(client, org, testRepo, pr.Number, pr.MergedAt.Value);
-            var status = ClassifyReviewStatus(pr, reviews);
-
-            Console.WriteLine($"PR #{pr.Number} — {status} — {reviews.Count} review(s)");
-        }
-
         try
         {
-            // 3) Fetch org repos (simple pagination)
-            var request = new RepositoryRequest { Type = RepositoryType.All, Sort = RepositorySort.Updated };
-            var page = 1;
-            var perPage = 50;
-            var all = new List<Repository>();
+            // 1) Config & client setup (kept minimal)
+            var (client, org) = BuildGitHubClient();
 
-            while (true)
-            {
-                var repos = await client.Repository.GetAllForOrg(org, new ApiOptions
-                {
-                    PageCount = 1,
-                    PageSize = perPage,
-                    StartPage = page
-                });
+            // 2) Demo inputs (feel free to promote these to args/config later)
+            var testRepo = "RootApp.Shared";
+            var start = DateTimeOffset.UtcNow.AddDays(-30);
 
-                if (repos.Count == 0) break;
-                all.AddRange(repos);
-                page++;
-            }
+            // 3) Run demos (each block is an isolated, re-runnable step)
+            // await DemoListOrgReposAsync(client, org, take: 10);
 
-            // 4) Print a quick summary
-            Console.WriteLine($"Org: {org} — Repositories found: {all.Count}");
-            foreach (var r in all.OrderByDescending(r => r.UpdatedAt).Take(10))
-            {
-                Console.WriteLine($"- {r.Name} (private: {r.Private}, updated: {r.UpdatedAt:O})");
-            }
+            // 4
+            await DemoRepoMetricsAsync(client, org, testRepo, start);
+
+
+            //var prs = await DemoMergedPrsAsync(client, org, testRepo, start, take: 10);
+            // await DemoReviewsAsync(client, org, testRepo, prs, take: 5);
+            // await DemoClassificationAsync(client, org, testRepo, prs, take: 5);
 
             return 0;
         }
@@ -100,9 +42,106 @@ class Program
             Console.Error.WriteLine($"Unexpected error: {ex.GetType().Name} - {ex.Message}");
             return 4;
         }
+    }
+
+    private static (GitHubClient client, string org) BuildGitHubClient()
+    {
+        var config = new ConfigurationBuilder()
+            .AddJsonFile("appsettings.json", optional: true)
+            .AddUserSecrets<Program>()
+            .Build();
+
+        var token = config["GitHub:Token"];
+        var org = config["GitHub:Org"];
+
+        if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(org))
+            throw new InvalidOperationException("GitHub:Token or GitHub:Org missing. Use `dotnet user-secrets set`.");
+
+        var client = new GitHubClient(new ProductHeaderValue("GitMon"))
+        {
+            Credentials = new Credentials(token)
+        };
+
+        return (client, org);
+    }
+
+    // Demo runners 
+    private static async Task DemoRepoMetricsAsync(
+    GitHubClient client,
+    string org,
+    string repo,
+    DateTimeOffset start)
+    {
+        var metrics = await ComputeRepoMetricsAsync(client, org, repo, start);
+
+        Console.WriteLine($"Repo: {metrics.Repo} (last 30d)");
+        Console.WriteLine($"Merged: {metrics.MergedCount}");
+        Console.WriteLine($"Reviewed Any: {metrics.ReviewedAny} ({metrics.Pct(metrics.ReviewedAny):F1}%)");
+        Console.WriteLine($"  Approved:          {metrics.Approved} ({metrics.Pct(metrics.Approved):F1}%)");
+        Console.WriteLine($"  Changes Requested: {metrics.ChangesRequested} ({metrics.Pct(metrics.ChangesRequested):F1}%)");
+        Console.WriteLine($"  Commented Only:    {metrics.CommentedOnly} ({metrics.Pct(metrics.CommentedOnly):F1}%)");
+        Console.WriteLine($"No Review:           {metrics.NoReview} ({metrics.Pct(metrics.NoReview):F1}%)");
+    }
 
 
+    private static async Task DemoListOrgReposAsync(GitHubClient client, string org, int take = 10)
+    {
+        var page = 1;
+        var perPage = 50;
+        var all = new List<Repository>();
 
+        while (true)
+        {
+            var repos = await client.Repository.GetAllForOrg(org, new ApiOptions
+            {
+                PageCount = 1,
+                PageSize = perPage,
+                StartPage = page
+            });
+
+            if (repos.Count == 0) break;
+            all.AddRange(repos);
+            page++;
+        }
+
+        Console.WriteLine($"Org: {org} — Repositories found: {all.Count}");
+        foreach (var r in all.OrderByDescending(r => r.UpdatedAt).Take(take))
+            Console.WriteLine($"- {r.Name} (private: {r.Private}, updated: {r.UpdatedAt:O})");
+    }
+
+    private static async Task<List<PullRequest>> DemoMergedPrsAsync(
+        GitHubClient client, string org, string repo, DateTimeOffset start, int take = 10)
+    {
+        var prs = (await FetchMergedPrsAsync(client, org, repo, start)).ToList();
+
+        Console.WriteLine($"{repo} — merged PRs in last 30d: {prs.Count}");
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(take))
+            Console.WriteLine($"#{pr.Number} by {pr.User.Login} — merged {pr.MergedAt:O} — {pr.Title}");
+
+        return prs;
+    }
+
+    private static async Task DemoReviewsAsync(
+        GitHubClient client, string org, string repo, List<PullRequest> prs, int take = 5)
+    {
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(take))
+        {
+            var reviews = await FetchReviewsAsync(client, org, repo, pr.Number, pr.MergedAt!.Value);
+            Console.WriteLine($"PR #{pr.Number} — {reviews.Count} review(s):");
+            foreach (var r in reviews)
+                Console.WriteLine($"  {r.User.Login}: {r.State} at {r.SubmittedAt:O}");
+        }
+    }
+
+    private static async Task DemoClassificationAsync(
+        GitHubClient client, string org, string repo, List<PullRequest> prs, int take = 5)
+    {
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(take))
+        {
+            var reviews = await FetchReviewsAsync(client, org, repo, pr.Number, pr.MergedAt!.Value);
+            var status = ClassifyReviewStatus(pr, reviews);
+            Console.WriteLine($"PR #{pr.Number} — {status} — {reviews.Count} review(s)");
+        }
     }
 
     static async Task<IReadOnlyList<PullRequest>> FetchMergedPrsAsync(
@@ -219,6 +258,44 @@ class Program
 
         return "NO_REVIEW";
     }
+
+    static async Task<RepoMetrics> ComputeRepoMetricsAsync(
+    GitHubClient client, string org, string repo, DateTimeOffset start, DateTimeOffset? end = null)
+    {
+        var prs = await FetchMergedPrsAsync(client, org, repo, start, end);
+
+        // Exclude drafts per your policy
+        prs = prs.Where(pr => !pr.Draft).ToList();
+
+        int approved = 0, changes = 0, commented = 0, none = 0;
+
+        foreach (var pr in prs)
+        {
+            if (!pr.Merged || !pr.MergedAt.HasValue) continue;
+
+            var reviews = await FetchReviewsAsync(client, org, repo, pr.Number, pr.MergedAt.Value);
+            var status = ClassifyReviewStatus(pr, reviews);
+
+            switch (status)
+            {
+                case "APPROVED": approved++; break;
+                case "CHANGES_REQUESTED": changes++; break;
+                case "COMMENTED": commented++; break;
+                case "NO_REVIEW": none++; break;
+                    // DRAFT_EXCLUDED won’t appear because we filtered drafts above
+            }
+        }
+
+        return new RepoMetrics(
+            Repo: repo,
+            MergedCount: approved + changes + commented + none,
+            Approved: approved,
+            ChangesRequested: changes,
+            CommentedOnly: commented,
+            NoReview: none
+        );
+    }
+
 
 
 }
