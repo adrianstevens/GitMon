@@ -35,6 +35,25 @@ class Program
             Console.WriteLine($"#{pr.Number} by {pr.User.Login} — merged {pr.MergedAt:O} — {pr.Title}");
         }
 
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(5))
+        {
+            var reviews = await FetchReviewsAsync(client, org, testRepo, pr.Number, pr.MergedAt.Value);
+
+            Console.WriteLine($"PR #{pr.Number} — {reviews.Count} review(s):");
+            foreach (var r in reviews)
+            {
+                Console.WriteLine($"  {r.User.Login}: {r.State} at {r.SubmittedAt:O}");
+            }
+        }
+
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(5))
+        {
+            var reviews = await FetchReviewsAsync(client, org, testRepo, pr.Number, pr.MergedAt.Value);
+            var status = ClassifyReviewStatus(pr, reviews);
+
+            Console.WriteLine($"PR #{pr.Number} — {status} — {reviews.Count} review(s)");
+        }
+
         try
         {
             // 3) Fetch org repos (simple pagination)
@@ -139,4 +158,67 @@ class Program
 
         return results;
     }
+
+    static async Task<IReadOnlyList<PullRequestReview>> FetchReviewsAsync(
+    GitHubClient client,
+    string org,
+    string repo,
+    int prNumber,
+    DateTimeOffset mergedAt,
+    int pageSize = 50)
+    {
+        var results = new List<PullRequestReview>();
+        int page = 1;
+
+        while (true)
+        {
+            var reviews = await client.PullRequest.Review.GetAll(org, repo, prNumber, new ApiOptions
+            {
+                PageSize = pageSize,
+                PageCount = 1,
+                StartPage = page
+            });
+
+            if (reviews.Count == 0)
+                break;
+
+            results.AddRange(reviews.Where(r => r.SubmittedAt < mergedAt));
+
+            if (reviews.Count < pageSize)
+                break;
+            page++;
+        }
+
+        return results;
+    }
+
+    static string ClassifyReviewStatus(
+    PullRequest pr,
+    IReadOnlyList<PullRequestReview> reviews)
+    {
+        if (pr.Draft)
+            return "DRAFT_EXCLUDED";
+
+        // Exclude self-reviews
+        var nonSelfReviews = reviews
+            .Where(r => !string.Equals(r.User.Login, pr.User.Login, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (nonSelfReviews.Count == 0)
+            return "NO_REVIEW";
+
+        // Use the enum on r.State.Value
+        if (nonSelfReviews.Any(r => r.State.Value == PullRequestReviewState.Approved))
+            return "APPROVED";
+
+        if (nonSelfReviews.Any(r => r.State.Value == PullRequestReviewState.ChangesRequested))
+            return "CHANGES_REQUESTED";
+
+        if (nonSelfReviews.Any(r => r.State.Value == PullRequestReviewState.Commented))
+            return "COMMENTED";
+
+        return "NO_REVIEW";
+    }
+
+
 }
