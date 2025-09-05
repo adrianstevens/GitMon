@@ -5,7 +5,6 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
-        // 1) Load config (user-secrets + optional appsettings.json)
         var config = new ConfigurationBuilder()
             .AddJsonFile("appsettings.json", optional: true)
             .AddUserSecrets<Program>()
@@ -20,12 +19,21 @@ class Program
             return 1;
         }
 
-        // 2) Create GitHub client
         var productHeader = new ProductHeaderValue("GitMon");
         var client = new GitHubClient(productHeader)
         {
             Credentials = new Credentials(token)
         };
+
+        var testRepo = "RootApp.Shared"; // e.g., "RootApp.Shared"
+        var start = DateTimeOffset.UtcNow.AddDays(-30);
+        var prs = await FetchMergedPrsAsync(client, org, testRepo, start);
+
+        Console.WriteLine($"{testRepo} — merged PRs in last 30d: {prs.Count}");
+        foreach (var pr in prs.OrderByDescending(p => p.MergedAt).Take(10))
+        {
+            Console.WriteLine($"#{pr.Number} by {pr.User.Login} — merged {pr.MergedAt:O} — {pr.Title}");
+        }
 
         try
         {
@@ -73,5 +81,62 @@ class Program
             Console.Error.WriteLine($"Unexpected error: {ex.GetType().Name} - {ex.Message}");
             return 4;
         }
+
+
+
+    }
+
+    static async Task<IReadOnlyList<PullRequest>> FetchMergedPrsAsync(
+    GitHubClient client,
+    string org,
+    string repo,
+    DateTimeOffset startInclusive,
+    DateTimeOffset? endInclusive = null,
+    int pageSize = 50)
+    {
+        // GitHub Search qualifier expects dates in yyyy-MM-dd (UTC)
+        string startStr = startInclusive.UtcDateTime.ToString("yyyy-MM-dd");
+        string endStr = (endInclusive ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("yyyy-MM-dd");
+
+        // Search: repo:ORG/REPO is:pr is:merged merged:START..END
+        // (Search returns Issues; we then hydrate each PR to get full details like MergedAt)
+        var query = $"repo:{org}/{repo} is:pr is:merged merged:{startStr}..{endStr}";
+        var results = new List<PullRequest>();
+
+        int page = 1;
+        while (true)
+        {
+            var searchReq = new SearchIssuesRequest(query)
+            {
+                PerPage = pageSize,
+                Page = page
+            };
+
+            var searchRes = await client.Search.SearchIssues(searchReq);
+
+            if (searchRes.Items.Count == 0)
+                break;
+
+            // Hydrate each PR
+            foreach (var item in searchRes.Items)
+            {
+                // item.Number is the PR number
+                var pr = await client.PullRequest.Get(org, repo, item.Number);
+                // Guard: ensure mergedAt inside our window (search should ensure this, but be strict)
+                if (pr.Merged == true && pr.MergedAt.HasValue &&
+                    pr.MergedAt.Value >= startInclusive &&
+                    pr.MergedAt.Value <= (endInclusive ?? DateTimeOffset.UtcNow))
+                {
+                    results.Add(pr);
+                }
+            }
+
+            // Stop if we've retrieved all results
+            int fetchedSoFar = page * pageSize;
+            if (fetchedSoFar >= searchRes.TotalCount) break;
+            page++;
+        }
+
+        return results;
     }
 }
