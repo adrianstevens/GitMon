@@ -11,19 +11,23 @@ class Program
             var (client, org) = BuildGitHubClient();
 
             // 2) Demo inputs (feel free to promote these to args/config later)
-            var testRepo = "RootApp.Shared";
-            var start = DateTimeOffset.UtcNow.AddDays(-30);
+            //var testRepo = "RootApp.Shared";
+            //var start = DateTimeOffset.UtcNow.AddDays(-30);
 
             // 3) Run demos (each block is an isolated, re-runnable step)
             // await DemoListOrgReposAsync(client, org, take: 10);
 
             // 4
-            await DemoRepoMetricsAsync(client, org, testRepo, start);
+            // await DemoRepoMetricsAsync(client, org, testRepo, start);
 
 
             //var prs = await DemoMergedPrsAsync(client, org, testRepo, start, take: 10);
             // await DemoReviewsAsync(client, org, testRepo, prs, take: 5);
             // await DemoClassificationAsync(client, org, testRepo, prs, take: 5);
+
+            Console.WriteLine("Running weekly org report…");
+            await RunWeeklyOrgReportAsync(client, org);
+            Console.WriteLine("Done.");
 
             return 0;
         }
@@ -42,6 +46,113 @@ class Program
             Console.Error.WriteLine($"Unexpected error: {ex.GetType().Name} - {ex.Message}");
             return 4;
         }
+    }
+
+    private static async Task RunWeeklyOrgReportAsync(GitHubClient client, string org)
+    {
+        var start = DateTimeOffset.UtcNow.AddDays(-7);
+        var repoNames = await GetAllRepoNamesAsync(client, org);
+
+        var rows = new List<(string Repo, int Merged, int Approved, int Changes, int Commented, int None)>();
+
+        Console.WriteLine($"Generating 7-day report for org '{org}' across {repoNames.Count} repos…");
+
+        foreach (var repo in repoNames.OrderBy(n => n))
+        {
+            var m = await ComputeRepoMetricsAsync(client, org, repo, start);
+
+            rows.Add((repo, m.MergedCount, m.Approved, m.ChangesRequested, m.CommentedOnly, m.NoReview));
+
+            // Brief console line per repo
+            var reviewedAny = m.ReviewedAny;
+            var pct = m.Pct(reviewedAny);
+
+            if (m.MergedCount > 0)
+            {
+                Console.WriteLine($"{repo,-40} merged:{m.MergedCount,4}  reviewed-any:{reviewedAny,4}  ({pct,5:F1}%)  no-review:{m.NoReview,3}");
+            }
+
+            await Task.Delay(5000); // delay to reduce chance of rate-limits
+        }
+
+        // Write CSV
+        var path = Path.Combine(Directory.GetCurrentDirectory(), "by_repo_7d.csv");
+        using (var sw = new StreamWriter(path))
+        {
+            await sw.WriteLineAsync("repo,merged_count,reviewed_any,reviewed_any_pct,approved,changes_requested,commented_only,no_review");
+            foreach (var r in rows)
+            {
+                var merged = r.Merged;
+                var reviewedAny = r.Approved + r.Changes + r.Commented;
+                var pct = merged == 0 ? 0.0 : (double)reviewedAny / merged * 100.0;
+
+                await sw.WriteLineAsync(
+                    $"{Escape(r.Repo)},{merged},{reviewedAny},{pct:F1},{r.Approved},{r.Changes},{r.Commented},{r.None}");
+            }
+        }
+
+        Console.WriteLine($"Wrote CSV: {path}");
+    }
+
+    private static async Task<T> TryWithRateLimitAsync<T>(Func<Task<T>> action, string opLabel)
+    {
+        while (true)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (RateLimitExceededException ex)
+            {
+                var resetLocal = ex.Reset.ToLocalTime();
+                var wait = resetLocal - DateTimeOffset.Now + TimeSpan.FromSeconds(2); // small buffer
+                if (wait < TimeSpan.Zero) wait = TimeSpan.FromSeconds(5);
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[rate-limit] {opLabel} hit limit. Waiting {wait.TotalSeconds:F0}s until {resetLocal:t}...");
+                Console.ResetColor();
+
+                await Task.Delay(wait);
+                // loop and retry
+            }
+        }
+    }
+
+
+    private static string Escape(string s)
+    {
+        // basic CSV escaping
+        if (s.Contains(',') || s.Contains('"') || s.Contains('\n'))
+            return $"\"{s.Replace("\"", "\"\"")}\"";
+        return s;
+    }
+
+    private static async Task<IReadOnlyList<string>> GetAllRepoNamesAsync(GitHubClient client, string org)
+    {
+        var names = new List<string>();
+        var page = 1;
+        const int perPage = 100;
+
+        while (true)
+        {
+            var repos = await client.Repository.GetAllForOrg(org, new ApiOptions
+            {
+                PageCount = 1,
+                PageSize = perPage,
+                StartPage = page
+            });
+
+            if (repos.Count == 0) break;
+
+            // Skip archived and forks
+            names.AddRange(repos
+                .Where(r => !r.Archived && !r.Fork)
+                .Select(r => r.Name));
+
+            page++;
+        }
+
+        return names;
     }
 
     private static (GitHubClient client, string org) BuildGitHubClient()
